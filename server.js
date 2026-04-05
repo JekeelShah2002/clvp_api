@@ -15,6 +15,10 @@ const apiRoutes = require('./routes/api');
 app.use('/api/upload', uploadRoutes);
 app.use('/api', apiRoutes);
 
-app.listen(PORT, () => {
-    console.log(`Server is running on port ${PORT}`);
-});
+if (process.env.NODE_ENV !== 'production') {
+    app.listen(PORT, () => {
+        console.log(`Server is running on port ${PORT}`);
+    });
+}
+
+module.exports = app;
