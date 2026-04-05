@@ -5,7 +5,7 @@ const csv = require('csv-parser');
 const { databases, ID, DATABASE_ID, DEMOGRAPHICS_COLLECTION, TRANSACTIONS_COLLECTION } = require('../appwrite');
 
 const router = express.Router();
-const upload = multer({ dest: 'uploads/' });
+const upload = multer({ dest: '/tmp' });
 
 router.post('/demographics', upload.single('file'), (req, res) => {
     console.log('[API] /demographics hit!');
