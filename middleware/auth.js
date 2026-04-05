@@ -18,11 +18,15 @@ const authMiddleware = async (req, res, next) => {
 
         const account = new Account(client);
 
+        const { Databases } = require('node-appwrite');
+        
         // Try getting the account - if the JWT is invalid or expired, this throws an error
         const user = await account.get();
         
         // Attach user info to the request for potential further use in endpoints
         req.user = user;
+        req.appwriteClient = client;
+        req.databases = new Databases(client);
         
         next();
     } catch (err) {
