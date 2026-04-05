@@ -11,6 +11,10 @@ app.use(express.json());
 // Routes
 const uploadRoutes = require('./routes/upload');
 const apiRoutes = require('./routes/api');
+const authMiddleware = require('./middleware/auth');
+
+// Secure all endpoints under /api
+app.use('/api', authMiddleware);
 
 app.use('/api/upload', uploadRoutes);
 app.use('/api', apiRoutes);
