@@ -15,6 +15,11 @@ const apiRoutes = require('./routes/api');
 app.use('/api/upload', uploadRoutes);
 app.use('/api', apiRoutes);
 
+// Base route so visitors don't see 404 when testing the root URL
+app.get('/', (req, res) => {
+    res.json({ message: 'CLV API is up and running!' });
+});
+
 if (process.env.NODE_ENV !== 'production') {
     app.listen(PORT, () => {
         console.log(`Server is running on port ${PORT}`);
