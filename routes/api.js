@@ -104,4 +104,42 @@ router.post('/features/compute', async (req, res) => {
     }
 });
 
+router.get('/customers/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        let demographics = null;
+        try {
+            demographics = await databases.getDocument(DATABASE_ID, DEMOGRAPHICS_COLLECTION, id);
+        } catch (err) {
+            if (err.code !== 404) console.warn("Demographics fetch error:", err.message);
+        }
+
+        let features = null;
+        try {
+            features = await databases.getDocument(DATABASE_ID, FEATURES_COLLECTION, id);
+        } catch (err) {
+            if (err.code !== 404) console.warn("Features fetch error:", err.message);
+        }
+
+        let transactions = [];
+        try {
+            const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.equal('customer_id', id), Query.limit(5000)]);
+            transactions = transList.documents;
+        } catch (err) {
+            console.warn("Transactions fetch error:", err.message);
+            // fallback if index missing
+            try {
+                const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.limit(5000)]);
+                transactions = transList.documents.filter(t => t.customer_id === id);
+            } catch(e) {}
+        }
+
+        res.json({ demographics, features, transactions });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
 module.exports = router;
