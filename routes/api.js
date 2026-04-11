@@ -1,21 +1,32 @@
 const express = require('express');
 const { Query } = require('node-appwrite');
-const { databases, DATABASE_ID, DEMOGRAPHICS_COLLECTION, TRANSACTIONS_COLLECTION, FEATURES_COLLECTION } = require('../appwrite');
+const { databases, DATABASE_ID, CONTACTS_COLLECTION, TRANSACTIONS_COLLECTION, FEATURES_COLLECTION } = require('../appwrite');
 const router = express.Router();
 
+// ─── Map Loyalty Tier label → numeric RFM score ────────────────────────────
+function loyaltyTierScore(tier) {
+    if (!tier) return 0;
+    switch (tier.toLowerCase().trim()) {
+        case 'high':   return 3;
+        case 'medium': return 2;
+        case 'low':    return 1;
+        default:       return 0;
+    }
+}
+
+// ─── GET /customers ────────────────────────────────────────────────────────
 router.get('/customers', async (req, res) => {
     try {
         const queryTerm = req.query.q || '';
         let queries = [Query.limit(50)];
         if (queryTerm) {
             queries.push(Query.contains('FullName', queryTerm));
-            // You might want to also query by customer_id if applicable, but Appwrite lacks native OR between different fields in some setups unless it's a dedicated search index.
         }
-        
-        const dems = await databases.listDocuments(DATABASE_ID, DEMOGRAPHICS_COLLECTION, queries);
+
+        const dems = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, queries);
         const features = await databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [Query.limit(100)]);
         const featureMap = {};
-        for(let doc of features.documents) {
+        for (let doc of features.documents) {
             featureMap[doc.customer_id] = doc;
         }
 
@@ -30,13 +41,13 @@ router.get('/customers', async (req, res) => {
     }
 });
 
+// ─── POST /features/compute ────────────────────────────────────────────────
 router.post('/features/compute', async (req, res) => {
     try {
-        // Fetch all transactions (pagination handle in prod, simplified here)
+        // Fetch all transactions
         const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.limit(5000)]);
-        
+
         const customerMap = {}; // Group by customer_id
-        
         for (const t of transList.documents) {
             const cid = t.customer_id;
             if (!customerMap[cid]) {
@@ -44,7 +55,7 @@ router.post('/features/compute', async (req, res) => {
             }
             customerMap[cid].totalValue += (t.TotalPrice || 0);
             customerMap[cid].count++;
-            
+
             if (t.PurchasedOn) {
                 const pDate = new Date(t.PurchasedOn);
                 if (!customerMap[cid].lastDate || pDate > customerMap[cid].lastDate) {
@@ -55,7 +66,18 @@ router.post('/features/compute', async (req, res) => {
                 }
             }
         }
-        
+
+        // Build a LoyaltyTier lookup from Contacts
+        let loyaltyMap = {};
+        try {
+            const contactDocs = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, [Query.limit(5000)]);
+            for (const c of contactDocs.documents) {
+                loyaltyMap[c.customer_id] = c.LoyaltyTier || null;
+            }
+        } catch (e) {
+            console.warn('[API] Could not fetch contacts for loyalty tier lookup:', e.message);
+        }
+
         let count = 0;
         const cids = Object.keys(customerMap);
         const BATCH_SIZE = 50;
@@ -66,19 +88,20 @@ router.post('/features/compute', async (req, res) => {
                 const data = customerMap[cid];
                 const aov = data.count > 0 ? (data.totalValue / data.count) : 0;
                 const msDiff = (data.lastDate && data.firstDate) ? (data.lastDate - data.firstDate) : 0;
-                const tenureDays = Math.max(1, Math.floor(msDiff / (1000*60*60*24)));
-                const freq = data.count / Math.max(1, (tenureDays / 30)); 
-                
+                const tenureDays = Math.max(1, Math.floor(msDiff / (1000 * 60 * 60 * 24)));
+                const freq = data.count / Math.max(1, (tenureDays / 30));
+
                 const payload = {
-                    customer_id: cid,
+                    customer_id:             cid,
                     total_transaction_value: data.totalValue,
-                    num_transactions: data.count,
-                    average_order_value: aov,
-                    last_purchase_date: data.lastDate ? data.lastDate.toISOString() : '',
-                    customer_tenure_days: tenureDays,
-                    frequency: freq
+                    num_transactions:        data.count,
+                    average_order_value:     aov,
+                    last_purchase_date:      data.lastDate ? data.lastDate.toISOString() : '',
+                    customer_tenure_days:    tenureDays,
+                    frequency:               freq,
+                    loyalty_tier_score:      loyaltyTierScore(loyaltyMap[cid])
                 };
-                
+
                 try {
                     await databases.getDocument(DATABASE_ID, FEATURES_COLLECTION, cid);
                     await databases.updateDocument(DATABASE_ID, FEATURES_COLLECTION, cid, payload);
@@ -91,11 +114,11 @@ router.post('/features/compute', async (req, res) => {
                 }
                 count++;
             });
-            
+
             await Promise.all(promises);
             console.log(`[API] Computed features up to ${Math.min(i + BATCH_SIZE, cids.length)} / ${cids.length}`);
         }
-        
+
         console.log(`[API] Fully computed features for ${count} customers.`);
         res.json({ message: 'Features computed successfully', customersProcessed: count });
     } catch (e) {
@@ -104,22 +127,23 @@ router.post('/features/compute', async (req, res) => {
     }
 });
 
+// ─── GET /customers/:id ────────────────────────────────────────────────────
 router.get('/customers/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        
+
         let demographics = null;
         try {
-            demographics = await databases.getDocument(DATABASE_ID, DEMOGRAPHICS_COLLECTION, id);
+            demographics = await databases.getDocument(DATABASE_ID, CONTACTS_COLLECTION, id);
         } catch (err) {
-            if (err.code !== 404) console.warn("Demographics fetch error:", err.message);
+            if (err.code !== 404) console.warn('Contacts fetch error:', err.message);
         }
 
         let features = null;
         try {
             features = await databases.getDocument(DATABASE_ID, FEATURES_COLLECTION, id);
         } catch (err) {
-            if (err.code !== 404) console.warn("Features fetch error:", err.message);
+            if (err.code !== 404) console.warn('Features fetch error:', err.message);
         }
 
         let transactions = [];
@@ -127,8 +151,7 @@ router.get('/customers/:id', async (req, res) => {
             const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.equal('customer_id', id), Query.limit(5000)]);
             transactions = transList.documents;
         } catch (err) {
-            console.warn("Transactions fetch error:", err.message);
-            // fallback if index missing
+            console.warn('Transactions fetch error:', err.message);
             try {
                 const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.limit(5000)]);
                 transactions = transList.documents.filter(t => t.customer_id === id);

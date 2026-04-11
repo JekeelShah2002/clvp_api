@@ -13,13 +13,17 @@ if (process.env.APPWRITE_API_KEY) {
 
 const databases = new Databases(client);
 
+const CONTACTS_COLLECTION = process.env.APPWRITE_CONTACTS_COLLECTION || 'Customer_Contacts';
+
 module.exports = {
     client,
     databases,
     ID,
     Query,
     DATABASE_ID: process.env.APPWRITE_DATABASE_ID || 'CLV_Database',
-    DEMOGRAPHICS_COLLECTION: process.env.APPWRITE_DEMOGRAPHICS_COLLECTION || 'Customer_Demographics',
+    // DEMOGRAPHICS_COLLECTION is now an alias for Contact data
+    DEMOGRAPHICS_COLLECTION: CONTACTS_COLLECTION,
+    CONTACTS_COLLECTION,
     TRANSACTIONS_COLLECTION: process.env.APPWRITE_TRANSACTIONS_COLLECTION || 'Transactions',
     FEATURES_COLLECTION: process.env.APPWRITE_FEATURES_COLLECTION || 'Customer_Features'
 };
