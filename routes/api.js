@@ -18,19 +18,50 @@ function loyaltyTierScore(tier) {
 router.get('/customers', async (req, res) => {
     try {
         const queryTerm = req.query.q || '';
-        let queries = [Query.limit(50)];
-        if (queryTerm) {
-            queries.push(Query.contains('FullName', queryTerm));
+        
+        let demsDocuments = [];
+        let cursor = null;
+        
+        while (true) {
+            let queries = [Query.limit(5000)];
+            if (queryTerm) {
+                queries.push(
+                    Query.or([
+                        Query.contains('FullName', queryTerm),
+                        Query.contains('customer_id', queryTerm)
+                    ])
+                );
+            }
+            if (cursor) queries.push(Query.cursorAfter(cursor));
+            
+            const resData = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, queries);
+            demsDocuments.push(...resData.documents);
+            if (resData.documents.length < 5000) break;
+            cursor = resData.documents[resData.documents.length - 1].$id;
         }
 
-        const dems = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, queries);
-        const features = await databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [Query.limit(100)]);
         const featureMap = {};
-        for (let doc of features.documents) {
-            featureMap[doc.customer_id] = doc;
+        const cids = demsDocuments.map(d => d.customer_id);
+        const BATCH_SIZE = 100; // Appwrite limit for Query.equal array
+        
+        for (let i = 0; i < cids.length; i += BATCH_SIZE) {
+            const chunk = cids.slice(i, i + BATCH_SIZE);
+            if (chunk.length === 0) continue;
+            
+            try {
+                const fRes = await databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [
+                    Query.equal('customer_id', chunk),
+                    Query.limit(BATCH_SIZE)
+                ]);
+                for (let doc of fRes.documents) {
+                    featureMap[doc.customer_id] = doc;
+                }
+            } catch (err) {
+                console.warn('[API] Error fetching features for chunk:', err.message);
+            }
         }
 
-        const enriched = dems.documents.map(d => ({
+        const enriched = demsDocuments.map(d => ({
             ...d,
             features: featureMap[d.customer_id] || null
         }));
@@ -44,38 +75,51 @@ router.get('/customers', async (req, res) => {
 // ─── POST /features/compute ────────────────────────────────────────────────
 router.post('/features/compute', async (req, res) => {
     try {
-        // Fetch all transactions
-        const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.limit(5000)]);
-
         const customerMap = {}; // Group by customer_id
-        for (const t of transList.documents) {
-            const cid = t.customer_id;
-            if (!customerMap[cid]) {
-                customerMap[cid] = { totalValue: 0, count: 0, lastDate: null, firstDate: null };
-            }
-            customerMap[cid].totalValue += (t.TotalPrice || 0);
-            customerMap[cid].count++;
-
-            if (t.PurchasedOn) {
-                const pDate = new Date(t.PurchasedOn);
-                if (!customerMap[cid].lastDate || pDate > customerMap[cid].lastDate) {
-                    customerMap[cid].lastDate = pDate;
-                }
-                if (!customerMap[cid].firstDate || pDate < customerMap[cid].firstDate) {
-                    customerMap[cid].firstDate = pDate;
-                }
-            }
-        }
-
-        // Build a LoyaltyTier lookup from Contacts
         let loyaltyMap = {};
-        try {
-            const contactDocs = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, [Query.limit(5000)]);
+
+        // Fetch all Contacts to initialize customerMap and LoyaltyTier lookup
+        let cCursor = null;
+        while (true) {
+            let queries = [Query.limit(5000)];
+            if (cCursor) queries.push(Query.cursorAfter(cCursor));
+            const contactDocs = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, queries);
             for (const c of contactDocs.documents) {
                 loyaltyMap[c.customer_id] = c.LoyaltyTier || null;
+                customerMap[c.customer_id] = { totalValue: 0, count: 0, lastDate: null, firstDate: null };
             }
-        } catch (e) {
-            console.warn('[API] Could not fetch contacts for loyalty tier lookup:', e.message);
+            if (contactDocs.documents.length < 5000) break;
+            cCursor = contactDocs.documents[contactDocs.documents.length - 1].$id;
+        }
+
+        // Fetch all Transactions using pagination
+        let tCursor = null;
+        while (true) {
+            let queries = [Query.limit(5000)];
+            if (tCursor) queries.push(Query.cursorAfter(tCursor));
+            const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, queries);
+            
+            for (const t of transList.documents) {
+                const cid = t.customer_id;
+                if (!customerMap[cid]) {
+                    customerMap[cid] = { totalValue: 0, count: 0, lastDate: null, firstDate: null };
+                }
+                customerMap[cid].totalValue += (t.TotalPrice || 0);
+                customerMap[cid].count++;
+
+                if (t.PurchasedOn) {
+                    const pDate = new Date(t.PurchasedOn);
+                    if (!customerMap[cid].lastDate || pDate > customerMap[cid].lastDate) {
+                        customerMap[cid].lastDate = pDate;
+                    }
+                    if (!customerMap[cid].firstDate || pDate < customerMap[cid].firstDate) {
+                        customerMap[cid].firstDate = pDate;
+                    }
+                }
+            }
+
+            if (transList.documents.length < 5000) break;
+            tCursor = transList.documents[transList.documents.length - 1].$id;
         }
 
         let count = 0;
@@ -148,13 +192,31 @@ router.get('/customers/:id', async (req, res) => {
 
         let transactions = [];
         try {
-            const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.equal('customer_id', id), Query.limit(5000)]);
-            transactions = transList.documents;
+            let tCursor = null;
+            while (true) {
+                let queries = [Query.equal('customer_id', id), Query.limit(5000)];
+                if (tCursor) queries.push(Query.cursorAfter(tCursor));
+                
+                const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, queries);
+                transactions.push(...transList.documents);
+                
+                if (transList.documents.length < 5000) break;
+                tCursor = transList.documents[transList.documents.length - 1].$id;
+            }
         } catch (err) {
-            console.warn('Transactions fetch error:', err.message);
+            console.warn('Transactions fetch error fallback:', err.message);
             try {
-                const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, [Query.limit(5000)]);
-                transactions = transList.documents.filter(t => t.customer_id === id);
+                let tCursor = null;
+                while (true) {
+                    let queries = [Query.limit(5000)];
+                    if (tCursor) queries.push(Query.cursorAfter(tCursor));
+                    
+                    const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, queries);
+                    transactions.push(...transList.documents.filter(t => t.customer_id === id));
+                    
+                    if (transList.documents.length < 5000) break;
+                    tCursor = transList.documents[transList.documents.length - 1].$id;
+                }
             } catch(e) {}
         }
 
