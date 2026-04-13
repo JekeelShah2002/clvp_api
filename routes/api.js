@@ -18,6 +18,7 @@ function loyaltyTierScore(tier) {
 router.get('/customers', async (req, res) => {
     try {
         const queryTerm = req.query.q || '';
+        console.log(`[API] => GET /customers requested. Query term: "${queryTerm}"`);
         
         let demsDocuments = [];
         let cursor = null;
@@ -44,22 +45,26 @@ router.get('/customers', async (req, res) => {
         const cids = demsDocuments.map(d => d.customer_id);
         const BATCH_SIZE = 100; // Appwrite limit for Query.equal array
         
+        const featurePromises = [];
         for (let i = 0; i < cids.length; i += BATCH_SIZE) {
             const chunk = cids.slice(i, i + BATCH_SIZE);
             if (chunk.length === 0) continue;
             
-            try {
-                const fRes = await databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [
-                    Query.equal('customer_id', chunk),
-                    Query.limit(BATCH_SIZE)
-                ]);
+            const p = databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [
+                Query.equal('customer_id', chunk),
+                Query.limit(BATCH_SIZE)
+            ])
+            .then(fRes => {
                 for (let doc of fRes.documents) {
                     featureMap[doc.customer_id] = doc;
                 }
-            } catch (err) {
+            })
+            .catch(err => {
                 console.warn('[API] Error fetching features for chunk:', err.message);
-            }
+            });
+            featurePromises.push(p);
         }
+        await Promise.all(featurePromises);
 
         const enriched = demsDocuments.map(d => ({
             ...d,
@@ -175,6 +180,7 @@ router.post('/features/compute', async (req, res) => {
 router.get('/customers/:id', async (req, res) => {
     try {
         const { id } = req.params;
+        console.log(`[API] => GET /customers/${id} requested. Retrieving specific customer details.`);
 
         let demographics = null;
         try {
