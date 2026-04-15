@@ -14,54 +14,89 @@ function loyaltyTierScore(tier) {
     }
 }
 
-// ─── GET /customers ────────────────────────────────────────────────────────
-router.get('/customers', async (req, res) => {
+// ─── GET /customers/top ─────────────────────────────────────────────────────
+// Returns the top 25 customers by loyalty tier → total transaction value.
+// Cost: 1 features list read + up to 25 contact reads = ~26 Appwrite ops.
+router.get('/customers/top', async (req, res) => {
     try {
-        const queryTerm = req.query.q || '';
-        console.log(`[API] => GET /customers requested. Query term: "${queryTerm}"`);
-        
-        let demsDocuments = [];
-        let cursor = null;
-        
-        while (true) {
-            let queries = [Query.limit(5000)];
-            if (queryTerm) {
-                queries.push(
-                    Query.or([
-                        Query.contains('FullName', queryTerm),
-                        Query.contains('customer_id', queryTerm)
-                    ])
-                );
-            }
-            if (cursor) queries.push(Query.cursorAfter(cursor));
-            
-            const resData = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, queries);
-            demsDocuments.push(...resData.documents);
-            if (resData.documents.length < 5000) break;
-            cursor = resData.documents[resData.documents.length - 1].$id;
+        console.log('[API] => GET /customers/top requested.');
+
+        // 1. Fetch top 25 feature docs sorted by tier desc, then value desc
+        const featsRes = await databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [
+            Query.orderDesc('loyalty_tier_score'),
+            Query.orderDesc('total_transaction_value'),
+            Query.limit(25)
+        ]);
+        const featureDocs = featsRes.documents;
+
+        if (featureDocs.length === 0) {
+            return res.json({ customers: [], mode: 'top' });
         }
 
+        // 2. Fetch exactly those 25 contact documents in parallel
+        const contactPromises = featureDocs.map(f =>
+            databases.getDocument(DATABASE_ID, CONTACTS_COLLECTION, f.customer_id)
+                .catch(() => ({ customer_id: f.customer_id })) // graceful fallback
+        );
+        const contactDocs = await Promise.all(contactPromises);
+
+        // 3. Merge features into contact objects
         const featureMap = {};
+        for (const f of featureDocs) featureMap[f.customer_id] = f;
+
+        const enriched = contactDocs.map(c => ({
+            ...c,
+            features: featureMap[c.customer_id] || null
+        }));
+
+        res.json({ customers: enriched, mode: 'top' });
+    } catch (e) {
+        console.error('[API] /customers/top error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ─── GET /customers ──────────────────────────────────────────────────────────
+// Search-only endpoint — requires ?q=<term>. Returns matching contacts + features.
+// Cost: 1 contacts search + N/100 feature batch reads (N = results found).
+router.get('/customers', async (req, res) => {
+    try {
+        const queryTerm = (req.query.q || '').trim();
+        if (!queryTerm) {
+            return res.status(400).json({ error: 'Search query is required. Use /customers/top for the default view.' });
+        }
+        console.log(`[API] => GET /customers search: "${queryTerm}"`);
+
+        // Search contacts collection
+        const searchRes = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, [
+            Query.or([
+                Query.contains('FullName', queryTerm),
+                Query.contains('customer_id', queryTerm)
+            ]),
+            Query.limit(50)
+        ]);
+        const demsDocuments = searchRes.documents;
+
+        if (demsDocuments.length === 0) {
+            return res.json({ customers: [], mode: 'search' });
+        }
+
+        // Fetch features for the matched customers
         const cids = demsDocuments.map(d => d.customer_id);
-        const BATCH_SIZE = 100; // Appwrite limit for Query.equal array
-        
+        const featureMap = {};
+        const BATCH_SIZE = 100;
+
         const featurePromises = [];
         for (let i = 0; i < cids.length; i += BATCH_SIZE) {
             const chunk = cids.slice(i, i + BATCH_SIZE);
-            if (chunk.length === 0) continue;
-            
             const p = databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [
                 Query.equal('customer_id', chunk),
                 Query.limit(BATCH_SIZE)
             ])
             .then(fRes => {
-                for (let doc of fRes.documents) {
-                    featureMap[doc.customer_id] = doc;
-                }
+                for (const doc of fRes.documents) featureMap[doc.customer_id] = doc;
             })
-            .catch(err => {
-                console.warn('[API] Error fetching features for chunk:', err.message);
-            });
+            .catch(err => console.warn('[API] Feature chunk error:', err.message));
             featurePromises.push(p);
         }
         await Promise.all(featurePromises);
@@ -71,7 +106,7 @@ router.get('/customers', async (req, res) => {
             features: featureMap[d.customer_id] || null
         }));
 
-        res.json({ customers: enriched });
+        res.json({ customers: enriched, mode: 'search' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
