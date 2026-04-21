@@ -1,55 +1,130 @@
 const express = require('express');
 const { Query } = require('node-appwrite');
-const { databases, DATABASE_ID, CONTACTS_COLLECTION, TRANSACTIONS_COLLECTION, FEATURES_COLLECTION } = require('../appwrite');
+const { databases, storage, DATABASE_ID, CONTACTS_COLLECTION, TRANSACTIONS_COLLECTION, FEATURES_COLLECTION, DASHBOARD_BUCKET_ID } = require('../appwrite');
+const { InputFile } = require('node-appwrite/file');
 const router = express.Router();
 
-// ─── Map Loyalty Tier label → numeric RFM score ────────────────────────────
-function loyaltyTierScore(tier) {
-    if (!tier) return 0;
-    switch (tier.toLowerCase().trim()) {
-        case 'high':   return 3;
-        case 'medium': return 2;
-        case 'low':    return 1;
-        default:       return 0;
+const fs = require('fs');
+const path = require('path');
+
+const DATA_DIR = path.join(__dirname, '..', 'data');
+const LOCAL_JSON_PATH = path.join(DATA_DIR, 'compiled_dashboard.json');
+const CLOUD_FILE_ID = 'dashboard_v1'; // We use a static ID for global access, or can use userID later
+
+if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR);
+}
+
+// ─── Helper to load JSON cache (Now Async to support Cloud Sync) ──────────────
+async function getDashboardData() {
+    // 1. Check local cache first
+    if (fs.existsSync(LOCAL_JSON_PATH)) {
+        try {
+            return JSON.parse(fs.readFileSync(LOCAL_JSON_PATH, 'utf-8'));
+        } catch (e) {
+            console.error('[API] Local JSON corruption, will try cloud sync:', e.message);
+        }
+    }
+
+    // 2. Fallback: Download from Appwrite Storage
+    console.log('[API] Local cache missing. Attempting Cloud Sync from Appwrite...');
+    try {
+        const response = await storage.getFileDownload(DASHBOARD_BUCKET_ID, CLOUD_FILE_ID);
+        // Ensure we have a proper Node.js Buffer from the ArrayBuffer
+        const buffer = Buffer.from(response);
+        fs.writeFileSync(LOCAL_JSON_PATH, buffer);
+        console.log('[API] Cloud recovery successful. Local cache updated.');
+        return JSON.parse(buffer.toString());
+    } catch (err) {
+        console.warn('[API] Cloud sync failed or file does not exist yet:', err.message);
+        return null;
     }
 }
 
+// ─── POST /dashboard/sync ──────────────────────────────────────────────────
+// Manually trigger a cloud backup of the local dashboard
+router.post('/dashboard/sync', async (req, res) => {
+    try {
+        if (!fs.existsSync(LOCAL_JSON_PATH)) {
+            return res.status(404).json({ error: 'No local dashboard found to sync.' });
+        }
+
+        console.log('[API] Syncing dashboard to cloud...');
+        
+        // Check if file exists to decide between Create or Update
+        let exists = false;
+        try {
+            await storage.getFile(DASHBOARD_BUCKET_ID, CLOUD_FILE_ID);
+            exists = true;
+        } catch (e) {}
+
+        if (exists) {
+            await storage.deleteFile(DASHBOARD_BUCKET_ID, CLOUD_FILE_ID);
+        }
+
+        await storage.createFile(
+            DASHBOARD_BUCKET_ID,
+            CLOUD_FILE_ID,
+            InputFile.fromPath(LOCAL_JSON_PATH, 'compiled_dashboard.json')
+        );
+
+        console.log('[API] Dashboard successfully pushed to Appwrite Storage.');
+        res.json({ status: 'success', message: 'Cloud backup complete.' });
+    } catch (err) {
+        console.error('[API] Cloud sync error:', err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// ─── GET /dashboard/status ──────────────────────────────────────────────────
+router.get('/dashboard/status', async (req, res) => {
+    try {
+        // Fast local check
+        if (fs.existsSync(LOCAL_JSON_PATH)) {
+            return res.json({ exists: true, source: 'local' });
+        }
+        
+        // Cloud check
+        try {
+            await storage.getFile(DASHBOARD_BUCKET_ID, CLOUD_FILE_ID);
+            return res.json({ exists: true, source: 'cloud' });
+        } catch (e) {
+            return res.json({ exists: false });
+        }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 // ─── GET /customers/top ─────────────────────────────────────────────────────
-// Returns the top 25 customers by loyalty tier → total transaction value.
-// Cost: 1 features list read + up to 25 contact reads = ~26 Appwrite ops.
 router.get('/customers/top', async (req, res) => {
     try {
         console.log('[API] => GET /customers/top requested.');
+        const db = await getDashboardData();
+        if (!db) return res.json({ customers: [], mode: 'top', notice: 'No data file found' });
 
-        // 1. Fetch top 25 feature docs sorted by tier desc, then value desc
-        const featsRes = await databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [
-            Query.orderDesc('loyalty_tier_score'),
-            Query.orderDesc('total_transaction_value'),
-            Query.limit(25)
-        ]);
-        const featureDocs = featsRes.documents;
+        // Convert object to array
+        const allCustomers = Object.values(db);
+        
+        // Sort by loyalty tier, then value
+        allCustomers.sort((a, b) => {
+            const tierA = a.features?.loyalty_tier_score || 0;
+            const tierB = b.features?.loyalty_tier_score || 0;
+            if (tierB !== tierA) return tierB - tierA;
+            
+            const valA = a.features?.total_transaction_value || 0;
+            const valB = b.features?.total_transaction_value || 0;
+            return valB - valA;
+        });
 
-        if (featureDocs.length === 0) {
-            return res.json({ customers: [], mode: 'top' });
-        }
-
-        // 2. Fetch exactly those 25 contact documents in parallel
-        const contactPromises = featureDocs.map(f =>
-            databases.getDocument(DATABASE_ID, CONTACTS_COLLECTION, f.customer_id)
-                .catch(() => ({ customer_id: f.customer_id })) // graceful fallback
-        );
-        const contactDocs = await Promise.all(contactPromises);
-
-        // 3. Merge features into contact objects
-        const featureMap = {};
-        for (const f of featureDocs) featureMap[f.customer_id] = f;
-
-        const enriched = contactDocs.map(c => ({
-            ...c,
-            features: featureMap[c.customer_id] || null
+        // Top 25
+        const top25 = allCustomers.slice(0, 25).map(c => ({
+            ...c.demographics,
+            customer_id: c.features.customer_id, // Root level for UI navigation
+            features: c.features
         }));
 
-        res.json({ customers: enriched, mode: 'top' });
+        res.json({ customers: top25, mode: 'top' });
     } catch (e) {
         console.error('[API] /customers/top error:', e);
         res.status(500).json({ error: e.message });
@@ -57,215 +132,72 @@ router.get('/customers/top', async (req, res) => {
 });
 
 // ─── GET /customers ──────────────────────────────────────────────────────────
-// Search-only endpoint — requires ?q=<term>. Returns matching contacts + features.
-// Cost: 1 contacts search + N/100 feature batch reads (N = results found).
 router.get('/customers', async (req, res) => {
     try {
-        const queryTerm = (req.query.q || '').trim();
+        const queryTerm = (req.query.q || '').trim().toLowerCase();
         if (!queryTerm) {
-            return res.status(400).json({ error: 'Search query is required. Use /customers/top for the default view.' });
+            return res.status(400).json({ error: 'Search query is required.' });
         }
         console.log(`[API] => GET /customers search: "${queryTerm}"`);
 
-        // Search contacts collection
-        const searchRes = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, [
-            Query.or([
-                Query.contains('FullName', queryTerm),
-                Query.contains('customer_id', queryTerm)
-            ]),
-            Query.limit(50)
-        ]);
-        const demsDocuments = searchRes.documents;
+        const db = await getDashboardData();
+        if (!db) return res.json({ customers: [], mode: 'search' });
 
-        if (demsDocuments.length === 0) {
-            return res.json({ customers: [], mode: 'search' });
-        }
+        const allCustomers = Object.values(db);
+        
+        const matched = allCustomers.filter(c => {
+            const name = (c.demographics?.FullName || '').toLowerCase();
+            const id = (c.demographics?.ContactId || c.features?.customer_id || '').toLowerCase();
+            return name.includes(queryTerm) || id.includes(queryTerm);
+        });
 
-        // Fetch features for the matched customers
-        const cids = demsDocuments.map(d => d.customer_id);
-        const featureMap = {};
-        const BATCH_SIZE = 100;
-
-        const featurePromises = [];
-        for (let i = 0; i < cids.length; i += BATCH_SIZE) {
-            const chunk = cids.slice(i, i + BATCH_SIZE);
-            const p = databases.listDocuments(DATABASE_ID, FEATURES_COLLECTION, [
-                Query.equal('customer_id', chunk),
-                Query.limit(BATCH_SIZE)
-            ])
-            .then(fRes => {
-                for (const doc of fRes.documents) featureMap[doc.customer_id] = doc;
-            })
-            .catch(err => console.warn('[API] Feature chunk error:', err.message));
-            featurePromises.push(p);
-        }
-        await Promise.all(featurePromises);
-
-        const enriched = demsDocuments.map(d => ({
-            ...d,
-            features: featureMap[d.customer_id] || null
+        const results = matched.slice(0, 50).map(c => ({
+            ...c.demographics,
+            customer_id: c.features.customer_id, // Root level for UI navigation
+            features: c.features
         }));
 
-        res.json({ customers: enriched, mode: 'search' });
+        res.json({ customers: results, mode: 'search' });
     } catch (e) {
         res.status(500).json({ error: e.message });
     }
 });
 
 // ─── POST /features/compute ────────────────────────────────────────────────
+// Legacy endpoint - no longer used by Angular client in Zero-Cost Architecture
 router.post('/features/compute', async (req, res) => {
-    try {
-        const customerMap = {}; // Group by customer_id
-        let loyaltyMap = {};
-
-        // Fetch all Contacts to initialize customerMap and LoyaltyTier lookup
-        let cCursor = null;
-        while (true) {
-            let queries = [Query.limit(5000)];
-            if (cCursor) queries.push(Query.cursorAfter(cCursor));
-            const contactDocs = await databases.listDocuments(DATABASE_ID, CONTACTS_COLLECTION, queries);
-            for (const c of contactDocs.documents) {
-                loyaltyMap[c.customer_id] = c.LoyaltyTier || null;
-                customerMap[c.customer_id] = { totalValue: 0, count: 0, lastDate: null, firstDate: null };
-            }
-            if (contactDocs.documents.length < 5000) break;
-            cCursor = contactDocs.documents[contactDocs.documents.length - 1].$id;
-        }
-
-        // Fetch all Transactions using pagination
-        let tCursor = null;
-        while (true) {
-            let queries = [Query.limit(5000)];
-            if (tCursor) queries.push(Query.cursorAfter(tCursor));
-            const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, queries);
-            
-            for (const t of transList.documents) {
-                const cid = t.customer_id;
-                if (!customerMap[cid]) {
-                    customerMap[cid] = { totalValue: 0, count: 0, lastDate: null, firstDate: null };
-                }
-                customerMap[cid].totalValue += (t.TotalPrice || 0);
-                customerMap[cid].count++;
-
-                if (t.PurchasedOn) {
-                    const pDate = new Date(t.PurchasedOn);
-                    if (!customerMap[cid].lastDate || pDate > customerMap[cid].lastDate) {
-                        customerMap[cid].lastDate = pDate;
-                    }
-                    if (!customerMap[cid].firstDate || pDate < customerMap[cid].firstDate) {
-                        customerMap[cid].firstDate = pDate;
-                    }
-                }
-            }
-
-            if (transList.documents.length < 5000) break;
-            tCursor = transList.documents[transList.documents.length - 1].$id;
-        }
-
-        let count = 0;
-        const cids = Object.keys(customerMap);
-        const BATCH_SIZE = 50;
-
-        for (let i = 0; i < cids.length; i += BATCH_SIZE) {
-            const batchCids = cids.slice(i, i + BATCH_SIZE);
-            const promises = batchCids.map(async (cid) => {
-                const data = customerMap[cid];
-                const aov = data.count > 0 ? (data.totalValue / data.count) : 0;
-                const msDiff = (data.lastDate && data.firstDate) ? (data.lastDate - data.firstDate) : 0;
-                const tenureDays = Math.max(1, Math.floor(msDiff / (1000 * 60 * 60 * 24)));
-                const freq = data.count / Math.max(1, (tenureDays / 30));
-
-                const payload = {
-                    customer_id:             cid,
-                    total_transaction_value: data.totalValue,
-                    num_transactions:        data.count,
-                    average_order_value:     aov,
-                    last_purchase_date:      data.lastDate ? data.lastDate.toISOString() : '',
-                    customer_tenure_days:    tenureDays,
-                    frequency:               freq,
-                    loyalty_tier_score:      loyaltyTierScore(loyaltyMap[cid])
-                };
-
-                try {
-                    await databases.getDocument(DATABASE_ID, FEATURES_COLLECTION, cid);
-                    await databases.updateDocument(DATABASE_ID, FEATURES_COLLECTION, cid, payload);
-                } catch (err) {
-                    if (err.code === 404) {
-                        await databases.createDocument(DATABASE_ID, FEATURES_COLLECTION, cid, payload);
-                    } else {
-                        console.error(`Error updating feature for ${cid}:`, err.message);
-                    }
-                }
-                count++;
-            });
-
-            await Promise.all(promises);
-            console.log(`[API] Computed features up to ${Math.min(i + BATCH_SIZE, cids.length)} / ${cids.length}`);
-        }
-
-        console.log(`[API] Fully computed features for ${count} customers.`);
-        res.json({ message: 'Features computed successfully', customersProcessed: count });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: e.message });
-    }
+    res.json({ message: 'Legacy compute endpoint skipped in new architecture.', customersProcessed: 0 });
 });
 
 // ─── GET /customers/:id ────────────────────────────────────────────────────
 router.get('/customers/:id', async (req, res) => {
     try {
         const { id } = req.params;
-        console.log(`[API] => GET /customers/${id} requested. Retrieving specific customer details.`);
+        console.log(`[API] => GET /customers/${id} requested.`);
 
-        let demographics = null;
-        try {
-            demographics = await databases.getDocument(DATABASE_ID, CONTACTS_COLLECTION, id);
-        } catch (err) {
-            if (err.code !== 404) console.warn('Contacts fetch error:', err.message);
+        const db = await getDashboardData();
+        if (!db) return res.status(404).json({ error: 'Database not initialized' });
+
+        const customer = db[id];
+        if (!customer) {
+            return res.status(404).json({ error: 'Customer not found' });
         }
 
-        let features = null;
-        try {
-            features = await databases.getDocument(DATABASE_ID, FEATURES_COLLECTION, id);
-        } catch (err) {
-            if (err.code !== 404) console.warn('Features fetch error:', err.message);
-        }
-
-        let transactions = [];
-        try {
-            let tCursor = null;
-            while (true) {
-                let queries = [Query.equal('customer_id', id), Query.limit(5000)];
-                if (tCursor) queries.push(Query.cursorAfter(tCursor));
-                
-                const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, queries);
-                transactions.push(...transList.documents);
-                
-                if (transList.documents.length < 5000) break;
-                tCursor = transList.documents[transList.documents.length - 1].$id;
-            }
-        } catch (err) {
-            console.warn('Transactions fetch error fallback:', err.message);
-            try {
-                let tCursor = null;
-                while (true) {
-                    let queries = [Query.limit(5000)];
-                    if (tCursor) queries.push(Query.cursorAfter(tCursor));
-                    
-                    const transList = await databases.listDocuments(DATABASE_ID, TRANSACTIONS_COLLECTION, queries);
-                    transactions.push(...transList.documents.filter(t => t.customer_id === id));
-                    
-                    if (transList.documents.length < 5000) break;
-                    tCursor = transList.documents[transList.documents.length - 1].$id;
-                }
-            } catch(e) {}
-        }
-
-        res.json({ demographics, features, transactions });
+        res.json({ 
+            demographics: customer.demographics, 
+            features: customer.features, 
+            transactions: customer.transactions 
+        });
     } catch (e) {
         console.error(e);
         res.status(500).json({ error: e.message });
     }
+});
+
+// ─── POST /features/scores ──────────────────────────────────────────────────
+// Legacy endpoint - no longer used by Angular client in Zero-Cost Architecture
+router.post('/features/scores', async (req, res) => {
+    res.json({ message: 'Legacy scores endpoint skipped in new architecture.', count: 0 });
 });
 
 module.exports = router;
