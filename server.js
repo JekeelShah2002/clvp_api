@@ -13,6 +13,15 @@ const uploadRoutes = require('./routes/upload');
 const apiRoutes = require('./routes/api');
 const authMiddleware = require('./middleware/auth');
 
+// DEV ONLY: Secret-key protected route — access via /dev/dashboard/analytics?key=YOUR_KEY
+const DEV_SECRET = process.env.DEV_API_KEY;
+app.use('/dev', (req, res, next) => {
+    if (req.query.key !== DEV_SECRET) {
+        return res.status(403).json({ error: 'Forbidden: Invalid dev key.' });
+    }
+    next();
+}, require('./routes/api'));
+
 // Secure all endpoints under /api
 app.use('/api', authMiddleware);
 

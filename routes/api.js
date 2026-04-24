@@ -15,7 +15,7 @@ if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR);
 }
 
-// ─── Helper to load JSON cache (Now Async to support Cloud Sync) ──────────────
+//   Helper to load JSON cache (Now Async to support Cloud Sync)      
 async function getDashboardData() {
     // 1. Check local cache first
     if (fs.existsSync(LOCAL_JSON_PATH)) {
@@ -41,7 +41,7 @@ async function getDashboardData() {
     }
 }
 
-// ─── POST /dashboard/sync ──────────────────────────────────────────────────
+//   POST /dashboard/sync 
 // Manually trigger a cloud backup of the local dashboard
 router.post('/dashboard/sync', async (req, res) => {
     try {
@@ -76,7 +76,7 @@ router.post('/dashboard/sync', async (req, res) => {
     }
 });
 
-// ─── GET /dashboard/status ──────────────────────────────────────────────────
+//   GET /dashboard/status 
 router.get('/dashboard/status', async (req, res) => {
     try {
         // Fast local check
@@ -96,7 +96,170 @@ router.get('/dashboard/status', async (req, res) => {
     }
 });
 
-// ─── GET /customers/top ─────────────────────────────────────────────────────
+//   GET /dashboard/analytics
+router.get('/dashboard/analytics', async (req, res) => {
+    try {
+        const db = await getDashboardData();
+        if (!db) return res.status(404).json({ error: 'No dashboard data available.' });
+
+        const allCustomers = Object.values(db);
+        const total = allCustomers.length;
+
+        //   KPIs    ─
+        let totalRevenue = 0, totalClv = 0, totalTransactions = 0;
+        let highTierCount = 0, atRiskCount = 0;
+
+        //   Distributions 
+        const segments = {};
+        const tiers = {};
+        const genders = {};
+        const occupations = {};
+        const states = {};
+        const satisfactions = {};
+        const emailSubs = { Yes: 0, No: 0 };
+
+        //   At-risk high-value list              ─
+        const atRiskHighValue = [];
+
+        //   Monthly revenue trend               
+        const monthlyRevenue = {};
+
+        //   CLV distribution buckets              
+        const clvBuckets = { '$0-$100': 0, '$100-$250': 0, '$250-$500': 0, '$500-$1K': 0, '$1K+': 0 };
+
+        //   Income brackets─
+        const incomeBrackets = { '<$30K': 0, '$30K-$60K': 0, '$60K-$100K': 0, '$100K-$200K': 0, '$200K+': 0 };
+
+        //   Top customers by CLV               ─
+        const topCustomers = [];
+
+        allCustomers.forEach(c => {
+            const f = c.features || {};
+            const d = c.demographics || {};
+
+            const rev = f.total_transaction_value || 0;
+            const clv = f.clv_score || 0;
+            const txCount = f.num_transactions || 0;
+            const seg = f.segment || 'Standard';
+            const tier = (d['Loyalty Tier'] || d.LoyaltyTier || 'unknown').toLowerCase();
+            const gender = d.Gender || 'Unknown';
+            const occ = d.Occupation || 'Unknown';
+            const state = d.State || 'Unknown';
+            const sat = (d.CustomerSatisfaction || 'unknown').toLowerCase();
+            const emailSub = d['Email Subscriber'] || d.EmailSubscriber || 'No';
+            const income = d.Income || 0;
+
+            totalRevenue += rev;
+            totalClv += clv;
+            totalTransactions += txCount;
+
+            if (tier === 'high') highTierCount++;
+            if (seg === 'At-Risk') atRiskCount++;
+
+            segments[seg] = (segments[seg] || 0) + 1;
+            tiers[tier] = (tiers[tier] || 0) + 1;
+            genders[gender] = (genders[gender] || 0) + 1;
+            occupations[occ] = (occupations[occ] || 0) + 1;
+            states[state] = (states[state] || 0) + 1;
+            satisfactions[sat] = (satisfactions[sat] || 0) + 1;
+            emailSubs[emailSub === 'Yes' ? 'Yes' : 'No']++;
+
+            // CLV bucket
+            if (clv < 100) clvBuckets['$0-$100']++;
+            else if (clv < 250) clvBuckets['$100-$250']++;
+            else if (clv < 500) clvBuckets['$250-$500']++;
+            else if (clv < 1000) clvBuckets['$500-$1K']++;
+            else clvBuckets['$1K+']++;
+
+            // Income bracket
+            if (income < 30000) incomeBrackets['<$30K']++;
+            else if (income < 60000) incomeBrackets['$30K-$60K']++;
+            else if (income < 100000) incomeBrackets['$60K-$100K']++;
+            else if (income < 200000) incomeBrackets['$100K-$200K']++;
+            else incomeBrackets['$200K+']++;
+
+            // At-risk high tier
+            if (seg === 'At-Risk' && f.loyalty_tier_score >= 2) {
+                atRiskHighValue.push({
+                    id: f.customer_id,
+                    name: d.FullName || `${d.FirstName || ''} ${d.LastName || ''}`.trim(),
+                    clv: clv,
+                    revenue: rev,
+                    recency: f.recency,
+                    tier: tier,
+                    action: f.suggested_action
+                });
+            }
+
+            // Top CLV customers
+            topCustomers.push({
+                id: f.customer_id,
+                name: d.FullName || 'Unknown',
+                clv: clv,
+                revenue: rev,
+                segment: seg,
+                tier: tier
+            });
+
+            // Monthly revenue from transactions
+            if (c.transactions && Array.isArray(c.transactions)) {
+                c.transactions.forEach(tx => {
+                    if (tx.PurchasedOn && tx.TotalPrice) {
+                        const d = new Date(tx.PurchasedOn);
+                        if (!isNaN(d.getTime())) {
+                            const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+                            monthlyRevenue[key] = (monthlyRevenue[key] || 0) + tx.TotalPrice;
+                        }
+                    }
+                });
+            }
+        });
+
+        // Sort & limit
+        atRiskHighValue.sort((a, b) => b.clv - a.clv);
+        topCustomers.sort((a, b) => b.clv - a.clv);
+
+        // Sort monthly keys
+        const sortedMonths = Object.keys(monthlyRevenue).sort();
+        const monthlyTrend = sortedMonths.map(k => ({ month: k, revenue: Math.round(monthlyRevenue[k]) }));
+
+        // Top states (top 10)
+        const topStates = Object.entries(states)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10)
+            .map(([state, count]) => ({ state, count }));
+
+        res.json({
+            kpis: {
+                totalCustomers: total,
+                totalRevenue: Math.round(totalRevenue),
+                totalForecastedCLV: Math.round(totalClv),
+                totalTransactions: totalTransactions,
+                avgOrderValue: Math.round(totalRevenue / Math.max(1, totalTransactions)),
+                avgClvPerCustomer: Math.round(totalClv / Math.max(1, total)),
+                highTierCustomers: highTierCount,
+                atRiskCustomers: atRiskCount
+            },
+            segments,
+            tiers,
+            genders,
+            occupations,
+            satisfactions,
+            emailSubscribers: emailSubs,
+            clvDistribution: clvBuckets,
+            incomeBrackets,
+            topStates,
+            monthlyRevenue: monthlyTrend,
+            atRiskHighValue: atRiskHighValue.slice(0, 20),
+            topCustomers: topCustomers.slice(0, 10)
+        });
+    } catch (e) {
+        console.error('[API] /dashboard/analytics error:', e);
+        res.status(500).json({ error: e.message });
+    }
+});
+
+//   GET /customers/top  
 router.get('/customers/top', async (req, res) => {
     try {
         console.log('[API] => GET /customers/top requested.');
@@ -131,7 +294,7 @@ router.get('/customers/top', async (req, res) => {
     }
 });
 
-// ─── GET /customers ──────────────────────────────────────────────────────────
+//   GET /customers    
 router.get('/customers', async (req, res) => {
     try {
         const queryTerm = (req.query.q || '').trim().toLowerCase();
@@ -163,13 +326,13 @@ router.get('/customers', async (req, res) => {
     }
 });
 
-// ─── POST /features/compute ────────────────────────────────────────────────
+//   POST /features/compute─
 // Legacy endpoint - no longer used by Angular client in Zero-Cost Architecture
 router.post('/features/compute', async (req, res) => {
     res.json({ message: 'Legacy compute endpoint skipped in new architecture.', customersProcessed: 0 });
 });
 
-// ─── GET /customers/:id ────────────────────────────────────────────────────
+//   GET /customers/:id  
 router.get('/customers/:id', async (req, res) => {
     try {
         const { id } = req.params;
@@ -194,7 +357,7 @@ router.get('/customers/:id', async (req, res) => {
     }
 });
 
-// ─── POST /features/scores ──────────────────────────────────────────────────
+//   POST /features/scores 
 // Legacy endpoint - no longer used by Angular client in Zero-Cost Architecture
 router.post('/features/scores', async (req, res) => {
     res.json({ message: 'Legacy scores endpoint skipped in new architecture.', count: 0 });
